@@ -1,101 +1,287 @@
-import Image from "next/image";
+'use client'
+import { useState, useEffect, useRef } from 'react';
 
-export default function Home() {
+// Define interfaces for our types
+interface NPKReadings {
+  N: number;
+  P: number;
+  K: number;
+  EC?: number;
+  temp?: number;
+  moisture?: number;
+}
+
+// Define the serial port interface
+interface SerialPortProps {
+  readable: ReadableStream<Uint8Array>;
+  close: () => Promise<void>;
+}
+
+export default function SoilProbePage() {
+  const [port, setPort] = useState<SerialPortProps | null>(null);
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [dataBuffer, setDataBuffer] = useState<string>('');
+  const [readings, setReadings] = useState<NPKReadings>({ N: 0, P: 0, K: 0, EC: 0, temp: 0, moisture: 0 });
+  const [logMessages, setLogMessages] = useState<string[]>([]);
+  const readerRef = useRef<any>(null);
+
+  // Add log message to our visible log
+  const addLog = (message: string, type: 'info' | 'success' | 'error' | 'warning' = 'info') => {
+    const timestamp = new Date().toLocaleTimeString();
+    const logEntry = `[${timestamp}] [${type}] ${message}`;
+    console.log(logEntry);
+    setLogMessages(prev => [logEntry, ...prev].slice(0, 100)); // Keep last 100 logs
+  };
+
+  // Connect to the serial device
+  const connectDevice = async () => {
+    try {
+      addLog('Requesting serial port...');
+      
+      // Use type assertion since navigator.serial is not in standard types
+      const serial = (navigator as any).serial;
+      
+      if (!serial) {
+        throw new Error("Web Serial API not supported in this browser");
+      }
+      
+      // Request a port from the user
+      const selectedPort = await serial.requestPort();
+      addLog(`Port selected, attempting to open at baud rate 9600...`);
+      
+      await selectedPort.open({ baudRate: 9600 }); // Change to 96000 if needed
+      
+      setPort(selectedPort as SerialPortProps);
+      setIsConnected(true);
+      addLog('Connection established successfully!', 'success');
+      
+      // Start reading data
+      startReading(selectedPort as SerialPortProps);
+    } catch (error) {
+      addLog(`Connection error: ${(error as Error).message}`, 'error');
+      console.error('Connection error:', error);
+    }
+  };
+
+  // Disconnect from the device
+  const disconnectDevice = async () => {
+    if (port) {
+      try {
+        // Stop the reader if it's active
+        if (readerRef.current) {
+          readerRef.current.cancel();
+        }
+        
+        // Close the port
+        await port.close();
+        setPort(null);
+        setIsConnected(false);
+        addLog('Device disconnected', 'info');
+      } catch (error) {
+        addLog(`Disconnect error: ${(error as Error).message}`, 'error');
+        console.error('Disconnect error:', error);
+      }
+    }
+  };
+
+  // Start reading data from the device
+  const startReading = async (selectedPort: SerialPortProps) => {
+    try {
+      addLog('Beginning to read data from device...');
+      
+      const reader = (selectedPort.readable as any).getReader();
+      readerRef.current = reader;
+      
+      // Read loop
+      while (true) {
+        const { value, done } = await reader.read();
+        
+        if (done) {
+          addLog('Serial reading stopped', 'warning');
+          reader.releaseLock();
+          break;
+        }
+        
+        // Decode the incoming data
+        const decoded = new TextDecoder().decode(value);
+        addLog(`Raw data received: ${decoded.replace(/\n/g, '\\n')}`);
+        
+        // Process the data
+        try {
+          processIncomingData(decoded);
+        } catch (processError) {
+          addLog(`Error processing data: ${(processError as Error).message}`, 'error');
+        }
+      }
+    } catch (error) {
+      addLog(`Reading error: ${(error as Error).message}`, 'error');
+      console.error('Reading error:', error);
+    } finally {
+      if (readerRef.current) {
+        try {
+          readerRef.current.releaseLock();
+        } catch (e) {
+          console.error('Error releasing reader lock:', e);
+        }
+        readerRef.current = null;
+      }
+    }
+  };
+
+  // Process incoming serial data
+  const processIncomingData = (newData: string) => {
+    // Add to our buffer
+    const updatedBuffer = dataBuffer + newData;
+    setDataBuffer(updatedBuffer);
+    
+    // Look for complete lines in the buffer
+    const lines = updatedBuffer.split('\n');
+    
+    // Keep the last potentially incomplete line in the buffer
+    if (lines.length > 1) {
+      setDataBuffer(lines[lines.length - 1]);
+      
+      // Process each complete line
+      for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i].trim();
+        if (line) {
+          addLog(`Processing line: ${line}`);
+          tryParseNPKData(line);
+        }
+      }
+    }
+  };
+
+  // Try to parse the data as NPK readings
+  const tryParseNPKData = (line: string) => {
+    try {
+      // This is a placeholder - adjust to match your actual data format
+      // Example parsing for format like "N:10,P:20,K:30,EC:40,temp:25,moisture:60"
+      const parts = line.split(',');
+      const result = { ...readings };
+      let hasChanged = false;
+      
+      parts.forEach(part => {
+        const [key, valueStr] = part.split(':');
+        if (key && valueStr) {
+          const trimmedKey = key.trim();
+          const numValue = parseFloat(valueStr);
+          
+          if (!isNaN(numValue)) {
+            // Type check to ensure the key is valid for our interface
+            if (trimmedKey === 'N' || trimmedKey === 'P' || trimmedKey === 'K' || 
+                trimmedKey === 'EC' || trimmedKey === 'temp' || trimmedKey === 'moisture') {
+              (result as any)[trimmedKey] = numValue;
+              hasChanged = true;
+            }
+          }
+        }
+      });
+      
+      if (hasChanged) {
+        const readingsStr = Object.entries(result)
+          .filter(([_, value]) => value !== undefined)
+          .map(([key, value]) => `${key}:${value}`)
+          .join(', ');
+        
+        addLog(`New readings parsed: ${readingsStr}`, 'success');
+        setReadings(result);
+      }
+    } catch (error) {
+      addLog(`Parse error on line: ${line} - ${(error as Error).message}`, 'error');
+    }
+  };
+
+  // Clean up on component unmount
+  useEffect(() => {
+    return () => {
+      if (port) {
+        disconnectDevice();
+      }
+    };
+  }, []);  // Empty dependency array to run only on unmount
+
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-8 row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="https://nextjs.org/icons/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li>Save and see your changes instantly.</li>
-        </ol>
-
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="container mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Soil NPK Testing Station</h1>
+      
+      <div className="mb-6">
+        {!isConnected ? (
+          <button 
+            onClick={connectDevice}
+            className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
           >
-            <Image
-              className="dark:invert"
-              src="https://nextjs.org/icons/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:min-w-44"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            Connect Device
+          </button>
+        ) : (
+          <button 
+            onClick={disconnectDevice}
+            className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
           >
-            Read our docs
-          </a>
+            Disconnect Device
+          </button>
+        )}
+        
+        <span className="ml-4">
+          Status: {isConnected ? 
+            <span className="text-green-600 font-bold">Connected</span> : 
+            <span className="text-red-600 font-bold">Disconnected</span>}
+        </span>
+      </div>
+      
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Readings Display */}
+        <div className="border rounded p-4 bg-gray-50">
+          <h2 className="text-xl font-bold mb-3">Current Readings</h2>
+          <div className="grid grid-cols-3 gap-4">
+            <div className="border rounded p-3 bg-white shadow-sm">
+              <h3 className="font-bold text-gray-700">Nitrogen (N)</h3>
+              <p className="text-2xl font-bold text-blue-600">{readings.N}</p>
+            </div>
+            <div className="border rounded p-3 bg-white shadow-sm">
+              <h3 className="font-bold text-gray-700">Phosphorus (P)</h3>
+              <p className="text-2xl font-bold text-green-600">{readings.P}</p>
+            </div>
+            <div className="border rounded p-3 bg-white shadow-sm">
+              <h3 className="font-bold text-gray-700">Potassium (K)</h3>
+              <p className="text-2xl font-bold text-purple-600">{readings.K}</p>
+            </div>
+            <div className="border rounded p-3 bg-white shadow-sm">
+              <h3 className="font-bold text-gray-700">EC</h3>
+              <p className="text-2xl font-bold text-yellow-600">{readings.EC}</p>
+            </div>
+            <div className="border rounded p-3 bg-white shadow-sm">
+              <h3 className="font-bold text-gray-700">Temperature</h3>
+              <p className="text-2xl font-bold text-red-600">{readings.temp}°C</p>
+            </div>
+            <div className="border rounded p-3 bg-white shadow-sm">
+              <h3 className="font-bold text-gray-700">Moisture</h3>
+              <p className="text-2xl font-bold text-cyan-600">{readings.moisture}%</p>
+            </div>
+          </div>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-6 flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="https://nextjs.org/icons/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+        
+        {/* Debugging Info */}
+        <div className="border rounded p-4 bg-gray-50">
+          <h2 className="text-xl font-bold mb-3">Debug Information</h2>
+          <div className="mb-3">
+            <h3 className="font-bold text-gray-700">Current Buffer</h3>
+            <pre className="bg-gray-100 p-2 rounded text-sm overflow-x-auto">
+              {dataBuffer || "(empty)"}
+            </pre>
+          </div>
+        </div>
+      </div>
+      
+      {/* Log Messages */}
+      <div className="mt-6 border rounded p-4 bg-gray-50">
+        <h2 className="text-xl font-bold mb-3">Communication Log</h2>
+        <div className="bg-black text-green-400 p-3 rounded h-64 overflow-y-auto font-mono text-sm">
+          {logMessages.length > 0 ? 
+            logMessages.map((msg, i) => <div key={i}>{msg}</div>) : 
+            <div className="text-gray-400">No logs yet. Connect your device to begin.</div>}
+        </div>
+      </div>
     </div>
   );
 }
