@@ -238,6 +238,7 @@ export default function SoilProbePage() {
 
       // Try to get already paired ports
       const ports = await serial.getPorts();
+      console.log(ports);
       addLog(`Found ${ports} already paired ports`, "info");
 
       // Try to enumerate connected devices
